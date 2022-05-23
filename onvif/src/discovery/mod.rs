@@ -35,6 +35,87 @@ pub struct Device {
     pub url: Url,
 }
 
+pub struct Discovery {
+    addr_responding_check: bool,
+}
+
+impl Default for Discovery {
+    fn default() -> Self {
+        Self {
+            addr_responding_check: true,
+        }
+    }
+}
+
+impl Discovery {
+    pub fn addr_responding_check(mut self, check: bool) -> Self {
+        self.addr_responding_check = check;
+        self
+    }
+
+    pub async fn discover(self, duration: Duration) -> Result<impl Stream<Item = Device>, Error> {
+        let probe = build_probe();
+        let probe_xml = yaserde::ser::to_string(&probe).map_err(Error::Serde)?;
+
+        debug!("Probe XML: {}", probe_xml);
+
+        let socket = {
+            const LOCAL_IPV4_ADDR: Ipv4Addr = Ipv4Addr::UNSPECIFIED;
+            const LOCAL_PORT: u16 = 0;
+
+            const MULTI_IPV4_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
+            const MULTI_PORT: u16 = 3702;
+
+            let local_socket_addr = SocketAddr::new(IpAddr::V4(LOCAL_IPV4_ADDR), LOCAL_PORT);
+            let multi_socket_addr = SocketAddr::new(IpAddr::V4(MULTI_IPV4_ADDR), MULTI_PORT);
+
+            let socket = UdpSocket::bind(local_socket_addr).await?;
+            socket.join_multicast_v4(MULTI_IPV4_ADDR, LOCAL_IPV4_ADDR)?;
+            socket
+                .send_to(probe_xml.as_bytes(), multi_socket_addr)
+                .await?;
+
+            socket
+        };
+
+        let addr_responding_check = self.addr_responding_check;
+
+        Ok(stream! {
+            let probe = &probe;
+            let socket = &socket;
+
+            let start = Instant::now();
+            loop {
+                let elapsed = start.elapsed();
+                if elapsed >= duration {
+                    break;
+                }
+
+                let timeout = duration - elapsed;
+
+                // Separate async block to be able to short-circuit on `None`.
+                let try_produce_item = async move {
+                    let xml = recv_string(socket, timeout).await.ok()?;
+                    debug!("Probe match XML: {}", xml);
+                    let envelope = yaserde::de::from_str::<probe_matches::Envelope>(&xml).ok()?;
+                    if envelope.header.relates_to != probe.header.message_id {
+                        return None;
+                    }
+                    if addr_responding_check {
+                        get_responding_addr(envelope, is_addr_responding).await
+                    } else {
+                        get_responding_addr(envelope, |_| ready(true)).await
+                    }
+                };
+
+                if let Some(item) = try_produce_item.await {
+                    yield item;
+                }
+            }
+        })
+    }
+}
+
 /// Discovers devices on a local network asynchronously using WS-discovery.
 ///
 /// Internally it sends a multicast probe and waits for responses for a specified amount of time.
@@ -85,59 +166,7 @@ pub struct Device {
 /// };
 /// ```
 pub async fn discover(duration: Duration) -> Result<impl Stream<Item = Device>, Error> {
-    let probe = build_probe();
-    let probe_xml = yaserde::ser::to_string(&probe).map_err(Error::Serde)?;
-
-    debug!("Probe XML: {}", probe_xml);
-
-    let socket = {
-        const LOCAL_IPV4_ADDR: Ipv4Addr = Ipv4Addr::UNSPECIFIED;
-        const LOCAL_PORT: u16 = 0;
-
-        const MULTI_IPV4_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
-        const MULTI_PORT: u16 = 3702;
-
-        let local_socket_addr = SocketAddr::new(IpAddr::V4(LOCAL_IPV4_ADDR), LOCAL_PORT);
-        let multi_socket_addr = SocketAddr::new(IpAddr::V4(MULTI_IPV4_ADDR), MULTI_PORT);
-
-        let socket = UdpSocket::bind(local_socket_addr).await?;
-        socket.join_multicast_v4(MULTI_IPV4_ADDR, LOCAL_IPV4_ADDR)?;
-        socket
-            .send_to(probe_xml.as_bytes(), multi_socket_addr)
-            .await?;
-
-        socket
-    };
-
-    Ok(stream! {
-        let probe = &probe;
-        let socket = &socket;
-
-        let start = Instant::now();
-        loop {
-            let elapsed = start.elapsed();
-            if elapsed >= duration {
-                break;
-            }
-
-            let timeout = duration - elapsed;
-
-            // Separate async block to be able to short-circuit on `None`.
-            let try_produce_item = async move {
-                let xml = recv_string(socket, timeout).await.ok()?;
-                debug!("Probe match XML: {}", xml);
-                let envelope = yaserde::de::from_str::<probe_matches::Envelope>(&xml).ok()?;
-                if envelope.header.relates_to != probe.header.message_id {
-                    return None;
-                }
-                get_responding_addr(envelope, is_addr_responding).await
-            };
-
-            if let Some(item) = try_produce_item.await {
-                yield item;
-            }
-        }
-    })
+    Discovery::default().discover(duration).await
 }
 
 async fn recv_string(s: &UdpSocket, timeout: Duration) -> io::Result<String> {
