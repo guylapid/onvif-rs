@@ -2,6 +2,7 @@ use crate::soap;
 use async_stream::stream;
 use futures_core::stream::Stream;
 use futures_util::{future::ready, stream::FuturesUnordered, StreamExt};
+use multicast_socket::{MulticastOptions, MulticastSocket};
 use schema::{
     transport::Error as TransportError,
     ws_discovery::{probe, probe_matches},
@@ -9,12 +10,13 @@ use schema::{
 use std::{
     future::Future,
     iter,
-    net::{IpAddr, Ipv4Addr, SocketAddr},
+    net::{Ipv4Addr, SocketAddrV4},
+    sync::Arc,
 };
 use thiserror::Error;
 use tokio::{
     io,
-    net::UdpSocket,
+    task::spawn_blocking,
     time::{self, Duration, Instant},
 };
 use tracing::debug;
@@ -37,12 +39,14 @@ pub struct Device {
 
 pub struct Discovery {
     addr_responding_check: bool,
+    interfaces: Vec<Ipv4Addr>,
 }
 
 impl Default for Discovery {
     fn default() -> Self {
         Self {
             addr_responding_check: true,
+            interfaces: vec![Ipv4Addr::UNSPECIFIED],
         }
     }
 }
@@ -53,36 +57,45 @@ impl Discovery {
         self
     }
 
+    pub fn interfaces(mut self, interfaces: Vec<Ipv4Addr>) -> Self {
+        self.interfaces = interfaces;
+        self
+    }
+
     pub async fn discover(self, duration: Duration) -> Result<impl Stream<Item = Device>, Error> {
         let probe = build_probe();
         let probe_xml = yaserde::ser::to_string(&probe).map_err(Error::Serde)?;
 
         debug!("Probe XML: {}", probe_xml);
 
-        let socket = {
-            const LOCAL_IPV4_ADDR: Ipv4Addr = Ipv4Addr::UNSPECIFIED;
-            const LOCAL_PORT: u16 = 0;
+        let interfaces = self.interfaces.clone();
 
+        let socket = spawn_blocking(move || -> Result<_, io::Error> {
             const MULTI_IPV4_ADDR: Ipv4Addr = Ipv4Addr::new(239, 255, 255, 250);
             const MULTI_PORT: u16 = 3702;
 
-            let local_socket_addr = SocketAddr::new(IpAddr::V4(LOCAL_IPV4_ADDR), LOCAL_PORT);
-            let multi_socket_addr = SocketAddr::new(IpAddr::V4(MULTI_IPV4_ADDR), MULTI_PORT);
+            let multi_socket_addr = SocketAddrV4::new(MULTI_IPV4_ADDR, MULTI_PORT);
 
-            let socket = UdpSocket::bind(local_socket_addr).await?;
-            socket.join_multicast_v4(MULTI_IPV4_ADDR, LOCAL_IPV4_ADDR)?;
-            socket
-                .send_to(probe_xml.as_bytes(), multi_socket_addr)
-                .await?;
+            let socket = MulticastSocket::with_options(
+                multi_socket_addr,
+                interfaces,
+                MulticastOptions {
+                    read_timeout: duration,
+                    buffer_size: 16 * 1024,
+                    ..Default::default()
+                },
+            )?;
+            socket.broadcast(probe_xml.as_bytes())?;
 
-            socket
-        };
+            Ok(Arc::new(socket))
+        })
+        .await
+        .map_err(io::Error::from)??;
 
         let addr_responding_check = self.addr_responding_check;
 
         Ok(stream! {
             let probe = &probe;
-            let socket = &socket;
 
             let start = Instant::now();
             loop {
@@ -92,6 +105,8 @@ impl Discovery {
                 }
 
                 let timeout = duration - elapsed;
+
+                let socket = socket.clone();
 
                 // Separate async block to be able to short-circuit on `None`.
                 let try_produce_item = async move {
@@ -169,11 +184,10 @@ pub async fn discover(duration: Duration) -> Result<impl Stream<Item = Device>, 
     Discovery::default().discover(duration).await
 }
 
-async fn recv_string(s: &UdpSocket, timeout: Duration) -> io::Result<String> {
-    let mut buf = vec![0; 16 * 1024];
-    let (len, _src) = time::timeout(timeout, s.recv_from(&mut buf)).await??;
+async fn recv_string(s: Arc<MulticastSocket>, timeout: Duration) -> io::Result<String> {
+    let message = time::timeout(timeout, spawn_blocking(move || s.receive())).await???;
 
-    Ok(String::from_utf8_lossy(&buf[..len]).to_string())
+    Ok(String::from_utf8_lossy(&message.data).to_string())
 }
 
 async fn get_responding_addr<F, Fut>(
