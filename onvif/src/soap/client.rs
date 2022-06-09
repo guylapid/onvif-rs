@@ -79,6 +79,7 @@ impl ClientBuilder {
     pub fn build(self) -> Client {
         #[allow(unused_mut)]
         let mut client_builder = reqwest::Client::builder()
+            .http1_title_case_headers()
             .redirect(reqwest::redirect::Policy::none())
             .timeout(self.config.timeout);
 
