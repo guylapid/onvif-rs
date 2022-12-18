@@ -48,7 +48,9 @@ impl Debug for Device {
 }
 
 type SetSocketOptionsFn = Box<
-    dyn Fn(&mut UdpSocket) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + Sync + 'static>>,
+    dyn Fn(&mut UdpSocket) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + Sync + 'static>>
+        + Send
+        + Sync,
 >;
 
 pub struct DiscoveryBuilder {
@@ -88,7 +90,7 @@ impl DiscoveryBuilder {
     /// This is useful for setting extra socket options like `SO_RCVBUF`.
     pub fn set_socket_options<F, Fut>(&mut self, set_socket_options: F) -> &mut Self
     where
-        F: Fn(&mut UdpSocket) -> Fut + 'static,
+        F: Fn(&mut UdpSocket) -> Fut + Send + Sync + 'static,
         Fut: Future<Output = io::Result<()>> + Send + Sync + 'static,
     {
         self.set_socket_options = Box::new(move |socket| Box::pin(set_socket_options(socket)));
