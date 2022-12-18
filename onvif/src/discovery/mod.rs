@@ -1,9 +1,10 @@
-use futures_core::stream::Stream;
+use futures_core::{future::Future, stream::Stream};
 use schema::ws_discovery::{probe, probe_matches};
 use std::{
     collections::HashSet,
     fmt::{Debug, Formatter},
     net::{IpAddr, Ipv4Addr, SocketAddr},
+    pin::Pin,
     sync::Arc,
 };
 use thiserror::Error;
@@ -46,10 +47,14 @@ impl Debug for Device {
     }
 }
 
-#[derive(Debug, Clone)]
+type SetSocketOptionsFn = Box<
+    dyn Fn(&mut UdpSocket) -> Pin<Box<dyn Future<Output = io::Result<()>> + Send + Sync + 'static>>,
+>;
+
 pub struct DiscoveryBuilder {
     duration: Duration,
     listen_address: IpAddr,
+    set_socket_options: SetSocketOptionsFn,
 }
 
 impl Default for DiscoveryBuilder {
@@ -57,6 +62,7 @@ impl Default for DiscoveryBuilder {
         Self {
             duration: Duration::from_secs(5),
             listen_address: IpAddr::V4(Ipv4Addr::UNSPECIFIED),
+            set_socket_options: Box::new(move |_| Box::pin(async { Ok(()) })),
         }
     }
 }
@@ -75,6 +81,17 @@ impl DiscoveryBuilder {
     /// on a specific network.
     pub fn listen_address(&mut self, listen_address: IpAddr) -> &mut Self {
         self.listen_address = listen_address;
+        self
+    }
+
+    /// Set socket options.
+    /// This is useful for setting extra socket options like `SO_RCVBUF`.
+    pub fn set_socket_options<F, Fut>(&mut self, set_socket_options: F) -> &mut Self
+    where
+        F: Fn(&mut UdpSocket) -> Fut + 'static,
+        Fut: Future<Output = io::Result<()>> + Send + Sync + 'static,
+    {
+        self.set_socket_options = Box::new(move |socket| Box::pin(set_socket_options(socket)));
         self
     }
 
@@ -131,6 +148,7 @@ impl DiscoveryBuilder {
         let Self {
             duration,
             listen_address,
+            set_socket_options,
         } = self;
 
         let probe = Arc::new(build_probe());
@@ -147,7 +165,8 @@ impl DiscoveryBuilder {
             let local_socket_addr = SocketAddr::new(*listen_address, LOCAL_PORT);
             let multi_socket_addr = SocketAddr::new(IpAddr::V4(MULTI_IPV4_ADDR), MULTI_PORT);
 
-            let socket = UdpSocket::bind(local_socket_addr).await?;
+            let mut socket = UdpSocket::bind(local_socket_addr).await?;
+            set_socket_options(&mut socket).await?;
 
             match listen_address {
                 IpAddr::V4(addr) => socket.join_multicast_v4(MULTI_IPV4_ADDR, *addr)?,
